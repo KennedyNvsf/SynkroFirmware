@@ -1,148 +1,206 @@
 #include "mqtt_manager.h"
 
-static MqttManager* s_self = nullptr;
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
-MqttManager::MqttManager(Client& netClient,
-                         const String& deviceId,
-                         const String& deviceName)
-: _mqtt(netClient),
-  _deviceId(deviceId),
-  _deviceName(deviceName)
-{
-  s_self = this;
-  _mqtt.setCallback(&_staticCallback);
+#include "devices/DeviceBase.h"
+#include "devices/LightingDevice.h"
 
-  _topicState = "synkro/devices/" + _deviceId + "/state";
-  _topicCtrl  = "synkro/devices/" + _deviceId + "/control";
-  _topicLwt   = "synkro/devices/" + _deviceId + "/lwt";
+// -------- statics --------
+
+static const char* sDeviceId    = nullptr;
+static const char* sDeviceName  = nullptr;
+static const char* sBrokerIp    = nullptr;
+static uint16_t    sBrokerPort  = 1883;
+static const char* sBrokerMdns  = nullptr;
+
+static LightingDevice* sMainLight = nullptr;
+
+static WiFiClient   sEspClient;
+static PubSubClient sMqtt(sEspClient);
+
+static unsigned long sLastReport      = 0;
+static const unsigned long REPORT_MS  = 10000UL;
+
+// forward declarations
+static void connectToMQTT();
+static void reportState();
+static void sendDiscovery();
+static void mqttCallback(char* topic, byte* payload, unsigned int length);
+
+static String wsUrlFromIp() {
+  // WebSocket URL for your Pi's broker (used for webapp)
+  return "ws://" + String(sBrokerIp) + ":9001";
 }
 
-void MqttManager::begin(const IPAddress& brokerIp, uint16_t brokerPort) {
-  _mqtt.setServer(brokerIp, brokerPort);
+static String mdnsHost() {
+  if (!sBrokerMdns || !strlen(sBrokerMdns)) return String("");
+  return String(sBrokerMdns) + ".local";
 }
 
-void MqttManager::tick(unsigned long nowMs) {
-  // maintain connection (non-blocking)
-  if (!_mqtt.connected()) {
-    if (nowMs >= _nextReconnectAt) {
-      tryConnectOnce();
-      _nextReconnectAt = nowMs + RECONNECT_INTERVAL;
-    }
-    return; // don't loop/publish when disconnected
+// -------- public API --------
+
+void mqtt_runtime::begin(const char* deviceId,
+                         const char* deviceName,
+                         const char* brokerIp,
+                         uint16_t    brokerPort,
+                         const char* brokerMdns,
+                         LightingDevice* mainLight) {
+  sDeviceId   = deviceId;
+  sDeviceName = deviceName;
+  sBrokerIp   = brokerIp;
+  sBrokerPort = brokerPort;
+  sBrokerMdns = brokerMdns;
+  sMainLight  = mainLight;
+
+  // Let devices publish per-device state via Device::mqtt()
+  Device::setMqttClient(&sMqtt);
+
+  sMqtt.setServer(sBrokerIp, sBrokerPort);
+  sMqtt.setCallback(mqttCallback);
+
+  connectToMQTT();
+}
+
+void mqtt_runtime::loop() {
+  if (!sMqtt.connected()) {
+    connectToMQTT();
   }
 
-  _mqtt.loop();
+  sMqtt.loop();
 
-  // periodic state+discovery
-  if (nowMs >= _nextReportAt) {
-    publishState();
-    publishDiscovery();
-    _nextReportAt = nowMs + REPORT_INTERVAL;
+  unsigned long now = millis();
+  if (now - sLastReport > REPORT_MS) {
+    sLastReport = now;
+    reportState();
+    sendDiscovery();  // keep discovery fresh
   }
 }
 
-void MqttManager::onLampChanged(bool lampOn) {
-  _lampOn = lampOn;
-  if (_mqtt.connected()) {
-    publishState(); // advertise immediately when connected
-  }
+void mqtt_runtime::notifyStateChanged() {
+  // Lightweight: just republish aggregate state right now.
+  reportState();
 }
 
-void MqttManager::forceReport(unsigned long /*nowMs*/) {
-  if (_mqtt.connected()) publishState();
-}
+// -------- internal helpers --------
 
-void MqttManager::tryConnectOnce() {
-  if (_mqtt.connected()) return;
-
-  // PubSubClient LWT via connect(clientId, willTopic, qos, retain, willMessage)
-  bool ok = _mqtt.connect(_deviceId.c_str(),
-                          _topicLwt.c_str(),
-                          1, true,
-                          "offline");
-
-  if (!ok) return;
-
-  publishLwtOnline();
-  subscribeControl();
-
-  // first announce
-  publishState();
-  publishDiscovery();
-}
-
-void MqttManager::publishLwtOnline() {
-  _mqtt.publish(_topicLwt.c_str(), "online", true /*retain*/);
-}
-
-void MqttManager::subscribeControl() {
-  _mqtt.subscribe(_topicCtrl.c_str());
-}
-
-void MqttManager::_staticCallback(char* topic, byte* payload, unsigned int len) {
-  if (s_self) s_self->_handleMessage(topic, payload, len);
-}
-
-void MqttManager::_handleMessage(char* topic, byte* payload, unsigned int len) {
-  if (String(topic) != _topicCtrl) return;
-
+static void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String msg;
-  msg.reserve(len);
-  for (unsigned int i = 0; i < len; ++i) msg += (char)payload[i];
+  msg.reserve(length + 1);
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
 
-  StaticJsonDocument<256> doc;
-  if (deserializeJson(doc, msg)) return;
+  Serial.print("[MQTT] Message on ");
+  Serial.print(topic);
+  Serial.print(": ");
+  Serial.println(msg);
 
-  // Expect {"action":"on"} or {"action":"off"}
-  if (doc.containsKey("action")) {
-    const String action = doc["action"].as<String>();
-    if (_onLampCommand) {
-      if (action == "on")  _onLampCommand(true);
-      if (action == "off") _onLampCommand(false);
-      // NOTE:
-      // IoManager will flip GPIO immediately and then call onLampChanged(...)
-      // so we do NOT publish state here to avoid double-publish.
+  if (!sDeviceId || !sMainLight) return;
+
+  // Global control topic: synkro/devices/<DEVICE_ID>/control
+  const String baseControl =
+      String("synkro/devices/") + sDeviceId + "/control";
+
+  if (String(topic) == baseControl) {
+    // Fan out to devices as needed (for now: single main light)
+    sMainLight->onMqttControl(msg);
+    // and immediately push aggregate state for the web UI
+    reportState();
+  }
+}
+
+static void connectToMQTT() {
+  if (!sDeviceId) return;
+
+  while (!sMqtt.connected()) {
+    Serial.print("[MQTT] Connecting...");
+
+    // LWT: synkro/devices/<ID>/lwt retained "offline"
+    String lwtTopic =
+        String("synkro/devices/") + sDeviceId + "/lwt";
+
+    bool ok = sMqtt.connect(
+        sDeviceId,
+        lwtTopic.c_str(),
+        1,
+        true,
+        "offline"
+    );
+
+    if (ok) {
+      Serial.println("connected!");
+
+      // Immediately publish ONLINE (retained) to the LWT topic
+      sMqtt.publish(lwtTopic.c_str(), "online", true);
+
+      // Subscribe to global control
+      String controlTopic =
+          String("synkro/devices/") + sDeviceId + "/control";
+      sMqtt.subscribe(controlTopic.c_str());
+      Serial.println("[MQTT] Subscribed to " + controlTopic);
+
+      // Announce current state + discovery
+      reportState();
+      sendDiscovery();
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(sMqtt.state());
+      Serial.println(" retrying in 5s...");
+      delay(5000);
     }
   }
 }
 
-void MqttManager::publishState() {
+static void reportState() {
+  if (!sMqtt.connected() || !sDeviceId || !sDeviceName) return;
+
   StaticJsonDocument<256> state;
-  state["deviceId"] = _deviceId;
-  state["name"]     = _deviceName;
+  state["deviceId"] = sDeviceId;
+  state["name"]     = sDeviceName;
   state["uptime"]   = millis() / 1000;
   state["status"]   = "online";
-  state["lamp"]     = _lampOn ? "on" : "off";
   state["ip"]       = WiFi.localIP().toString();
-  state["brokerUrl"]= String("ws://") + WiFi.localIP().toString() + ":9001";
-#ifdef BROKER_MDNS
-  if (String(BROKER_MDNS).length()) {
-    state["mdns"] = String(BROKER_MDNS) + ".local";
+  state["brokerUrl"]= wsUrlFromIp();
+  if (mdnsHost().length()) state["mdns"] = mdnsHost();
+
+  // IMPORTANT: this matches Firestore liveKey = "light"
+  if (sMainLight) {
+    state["light"] = sMainLight->isOn() ? "on" : "off";
   }
-#endif
 
   String msg;
   serializeJson(state, msg);
 
-  _mqtt.publish(_topicState.c_str(), msg.c_str(), false);
-  _mqtt.publish("synkro/devices/state", msg.c_str(), false);
-  _mqtt.publish(_topicLwt.c_str(), "online", true);
+  // Aggregate topic used by your web app
+  String topicPerDevice =
+      String("synkro/devices/") + sDeviceId + "/state";
+  sMqtt.publish(topicPerDevice.c_str(), msg.c_str());
+
+  // Optional legacy global topic
+  sMqtt.publish("synkro/devices/state", msg.c_str());
+
+  // Also publish per-device state (for future)
+  if (sMainLight) {
+    sMainLight->publishState(sDeviceId);
+  }
+
+  Serial.println("[MQTT] State reported: " + msg);
 }
 
-void MqttManager::publishDiscovery() {
+static void sendDiscovery() {
+  if (!sMqtt.connected() || !sDeviceId || !sDeviceName) return;
+
   StaticJsonDocument<256> doc;
-  doc["id"]        = _deviceId;
-  doc["name"]      = _deviceName;
+  doc["id"]        = sDeviceId;
+  doc["name"]      = sDeviceName;
   doc["ip"]        = WiFi.localIP().toString();
   doc["status"]    = "online";
-  doc["brokerUrl"] = String("ws://") + WiFi.localIP().toString() + ":9001";
-#ifdef BROKER_MDNS
-  if (String(BROKER_MDNS).length()) {
-    doc["mdns"] = String(BROKER_MDNS) + ".local";
-  }
-#endif
+  doc["brokerUrl"] = wsUrlFromIp();
+  if (mdnsHost().length()) doc["mdns"] = mdnsHost();
 
   String msg;
   serializeJson(doc, msg);
-  _mqtt.publish("synkro/discovery", msg.c_str(), false);
+
+  sMqtt.publish("synkro/discovery", msg.c_str());
+  Serial.println("[MQTT] Discovery sent: " + msg);
 }

@@ -1,77 +1,60 @@
 #include "wifi_manager.h"
 
-static Preferences prefs;
-static AsyncWebServer server(80);
-static bool provisioning = false;
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <Preferences.h>
+#include <esp_system.h>
 
-void WiFiManager::connectOrProvision(const char* apSsid, const char* apPass, const char* hostname) {
-  prefs.begin("wifi", false);
-  String ssid = prefs.getString("ssid", "");
-  String pass = prefs.getString("pass", "");
-  prefs.end();
+// --- statics (module-private) ---
 
-  if (ssid.isEmpty() || pass.isEmpty()) {
-    Serial.println("[WiFi] No saved credentials → provisioning");
-    startProvisioning(apSsid, apPass);
-    provisioning = true;
-    return;
-  }
+static AsyncWebServer sServer(80);
+static Preferences    sPrefs;
 
-  Serial.printf("[WiFi] Connecting to %s ...\n", ssid.c_str());
-  WiFi.mode(WIFI_STA);
-  if (hostname && strlen(hostname)) {
-    // set hostname before begin on some cores
-    WiFi.setHostname(hostname);
-  }
-  WiFi.begin(ssid.c_str(), pass.c_str());
+static bool   sProvisioning = false;
+static String sSsid;
+static String sPass;
 
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000UL) {
-    Serial.print(".");
-    delay(500);
-  }
+static String sApSsid;
+static String sApPass;
+static String sDeviceId;
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] ✅ Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("\n[WiFi] ❌ Failed. Switching to provisioning mode.");
-    startProvisioning(apSsid, apPass);
-    provisioning = true;
-  }
-}
+// ---------- internal helpers ----------
 
-bool WiFiManager::isConnected() {
-  return !provisioning && WiFi.status() == WL_CONNECTED;
-}
-
-void WiFiManager::startProvisioning(const char* apSsid, const char* apPass) {
+static void startProvisioningInternal() {
   Serial.println("\n[Provisioning Mode]");
+  sProvisioning = true;
+
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(apSsid, apPass);
+  WiFi.softAP(sApSsid.c_str(), sApPass.c_str());
+  IPAddress apIp = WiFi.softAPIP();
 
-  Serial.printf("AP IP: %s\n", WiFi.softAPIP().toString().c_str());
+  Serial.print("AP IP: ");
+  Serial.println(apIp);
 
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req){
-    req->send(200, "text/html",
+  sServer.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
+    req->send(
+      200,
+      "text/html",
       "<h2>Synkro WiFi Setup</h2>"
       "<form action='/wifi' method='POST'>"
       "SSID: <input name='ssid'><br>"
       "Password: <input name='pass' type='password'><br><br>"
-      "<button type='submit'>Save</button></form>");
+      "<button type='submit'>Save</button></form>"
+    );
   });
 
-  server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *req){
+  sServer.on("/wifi", HTTP_POST, [](AsyncWebServerRequest* req) {
     if (req->hasParam("ssid", true) && req->hasParam("pass", true)) {
       String newSsid = req->getParam("ssid", true)->value();
       String newPass = req->getParam("pass", true)->value();
 
-      prefs.begin("wifi", false);
-      prefs.putString("ssid", newSsid);
-      prefs.putString("pass", newPass);
-      prefs.end();
+      sPrefs.begin("wifi", false);
+      sPrefs.putString("ssid", newSsid);
+      sPrefs.putString("pass", newPass);
+      sPrefs.end();
 
       req->send(200, "text/plain", "Saved! Rebooting...");
-      Serial.println("[WiFi] Credentials saved. Rebooting...");
+      Serial.println("[WiFi] Credentials received, rebooting...");
       delay(800);
       ESP.restart();
     } else {
@@ -79,11 +62,85 @@ void WiFiManager::startProvisioning(const char* apSsid, const char* apPass) {
     }
   });
 
-  server.begin();
+  sServer.begin();
 
+  Serial.println();
   Serial.println("-------------------------------------------------------------");
-  Serial.printf("🔗 Connect to Wi-Fi: %s\n", apSsid);
-  Serial.printf("🔑 Password:        %s\n", apPass);
-  Serial.printf("🌐 Open:            http://%s/\n", WiFi.softAPIP().toString().c_str());
+  Serial.println("🔗 Connect to Wi-Fi: " + sApSsid);
+  Serial.println("🔑 Password:        " + sApPass);
+  Serial.println("🌐 Open:            http://" + apIp.toString() + "/");
   Serial.println("-------------------------------------------------------------");
+}
+
+static void connectStaInternal() {
+  Serial.print("[WiFi] Connecting to ");
+  Serial.println(sSsid);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(sDeviceId.c_str());
+  WiFi.begin(sSsid.c_str(), sPass.c_str());
+
+  unsigned long startAttemptTime = millis();
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startAttemptTime < 20000UL) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WiFi] Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+    sProvisioning = false;
+  } else {
+    Serial.println("\n[WiFi] Failed to connect. Switching to provisioning mode.");
+    startProvisioningInternal();
+  }
+}
+
+// ---------- public API ----------
+
+void wifi_portal::begin(const char* deviceId,
+                        const char* apSsid,
+                        const char* apPass) {
+  sDeviceId = deviceId;
+  sApSsid   = apSsid;
+  sApPass   = apPass;
+
+  // Check reset reason — clear creds on physical reset
+  esp_reset_reason_t reason = esp_reset_reason();
+  sPrefs.begin("wifi", false);
+
+  if (reason == ESP_RST_EXT) {
+    Serial.println("[RESET] Physical reset detected → clearing Wi-Fi credentials...");
+    sPrefs.clear();
+    sPrefs.end();
+    delay(400);
+    startProvisioningInternal();
+    return;
+  }
+
+  sSsid = sPrefs.getString("ssid", "");
+  sPass = sPrefs.getString("pass", "");
+  sPrefs.end();
+
+  if (sSsid.isEmpty() || sPass.isEmpty()) {
+    Serial.println("[WiFi] No saved Wi-Fi credentials → provisioning mode.");
+    startProvisioningInternal();
+  } else {
+    connectStaInternal();
+  }
+}
+
+bool wifi_portal::isProvisioning() {
+  return sProvisioning;
+}
+
+bool wifi_portal::isConnected() {
+  return (!sProvisioning) && (WiFi.status() == WL_CONNECTED);
+}
+
+void wifi_portal::loop() {
+  // Currently nothing to do; AsyncWebServer is event-based.
+  // Kept for symmetry / future reconnect logic.
 }

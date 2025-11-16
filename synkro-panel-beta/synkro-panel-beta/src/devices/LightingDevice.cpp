@@ -1,16 +1,20 @@
+// src/devices/LightingDevice.cpp
 #include "LightingDevice.h"
 #include <ArduinoJson.h>
 
+// New: use the MQTT runtime helper (provides notifyMainStateChanged alias)
+#include "core/mqtt_manager.h"
+
 LightingDevice::LightingDevice(
-    const String& id,
-    const String& name,
-    const String& room,
-    uint8_t relayPin,
-    uint8_t buttonPin
+  const String& id,
+  const String& name,
+  const String& room,
+  uint8_t relayPin,
+  uint8_t buttonPin
 )
-: Device(id, name, "lighting", room),
-  _relayPin(relayPin),
-  _buttonPin(buttonPin) {}
+  : Device(id, name, "lighting", room),
+    _relayPin(relayPin),
+    _buttonPin(buttonPin) {}
 
 void LightingDevice::begin() {
   pinMode(_relayPin, OUTPUT);
@@ -34,11 +38,17 @@ void LightingDevice::handle() {
 void LightingDevice::toggle() {
   _on = !_on;
   writeRelay();
+
+  // Tell MQTT runtime so it republishes aggregate state (light:on/off)
+  notifyMainStateChanged();   // inline alias → mqtt_runtime::notifyStateChanged()
 }
 
 void LightingDevice::setOn(bool v) {
   _on = v;
   writeRelay();
+
+  // Also notify MQTT runtime when state is changed programmatically
+  notifyMainStateChanged();
 }
 
 void LightingDevice::writeRelay() {
@@ -54,9 +64,10 @@ void LightingDevice::onMqttControl(const String& json) {
     toggle();
     return;
   }
+
   if (doc.containsKey("action")) {
     String a = doc["action"].as<String>();
-    if (a == "on") setOn(true);
+    if (a == "on")      setOn(true);
     else if (a == "off") setOn(false);
   }
 }
@@ -64,15 +75,16 @@ void LightingDevice::onMqttControl(const String& json) {
 void LightingDevice::publishState(const String& deviceIdRoot) {
   if (!mqtt()) return;
 
-  // per-device state (namespaced under device root)
+  // Per-device state topic (for future use):
   // synkro/devices/<DEVICE_ID>/lighting/<DEVICE_ITEM_ID>/state
-  const String topic = "synkro/devices/" + deviceIdRoot + "/lighting/" + id() + "/state";
+  const String topic =
+    "synkro/devices/" + deviceIdRoot + "/lighting/" + id() + "/state";
 
   StaticJsonDocument<256> st;
-  st["type"] = "lighting";
-  st["room"] = room();
-  st["name"] = name();
-  st["id"]   = id();
+  st["type"]  = "lighting";
+  st["room"]  = room();
+  st["name"]  = name();
+  st["id"]    = id();
   st["state"] = _on ? "on" : "off";
 
   String payload;

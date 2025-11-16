@@ -1,4 +1,5 @@
 #pragma once
+
 #include "DeviceBase.h"
 
 class LightingDevice : public Device {
@@ -11,7 +12,6 @@ public:
 
   void begin() override;
   void handle() override;
-
   void onMqttControl(const String& json) override;
   void publishState(const String& deviceIdRoot) override;
 
@@ -24,7 +24,6 @@ private:
 
   uint8_t _relayPin;
   uint8_t _buttonPin;
-
-  bool _on = false;
+  bool    _on = false;
   unsigned long _lastButtonMs = 0;
 };

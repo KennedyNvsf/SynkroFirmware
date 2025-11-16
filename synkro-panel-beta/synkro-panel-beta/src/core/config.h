@@ -9,7 +9,7 @@
 #define DEVICE_NAME "IEFP_AUDITORIUM"
 
 // ---------- MQTT Broker (TCP for ESP32) ----------
-#define BROKER_IP    IPAddress(192,168,1,90)
+#define BROKER_IP     "192.168.1.90"
 #define BROKER_PORT  1883
 
 // Optional: mDNS hostname of the broker (without .local) — hint for UI
