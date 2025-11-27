@@ -1,5 +1,4 @@
- #pragma once
-
+#pragma once
 #include <stdint.h>
 
 class LightingDevice;
@@ -11,6 +10,24 @@ class LightingDevice;
 //  - aggregate state on synkro/devices/<ID>/state (with "light")
 //  - discovery on synkro/discovery
 //  - fanning control JSON to devices
+//  - OPTIONAL: dynamic broker IP updates via MQTT config topic
+//
+// Dynamic broker IP (Option A)
+// ----------------------------
+// If your Raspberry Pi publishes a config message like:
+//
+//   Topic:  synkro/broker/config
+//   Payload: { "tcpBrokerIp": "192.168.1.90" }
+//
+// the firmware will:
+//   - update its internal broker IP
+//   - persist it to NVS (namespace "mqtt", key "broker_ip")
+//   - reconnect to the new broker IP on the next attempt.
+//
+// On boot, the runtime will:
+//   - read "mqtt/broker_ip" from NVS;
+//   - if present, use it;
+//   - otherwise fall back to the brokerIp passed to begin().
 
 namespace mqtt_runtime {
 
@@ -18,14 +35,14 @@ namespace mqtt_runtime {
   //
   // deviceId   : e.g. "synkro_res_p_beta"
   // deviceName : friendly name ("IEFP_AUDITORIUM")
-  // brokerIp   : TCP broker for ESP32 (e.g. "192.168.1.90")
+  // brokerIp   : default broker IP (hint / fallback)
   // brokerPort : usually 1883
   // brokerMdns : optional mDNS hostname WITHOUT ".local" (e.g. "synkro-discovery")
   void begin(const char* deviceId,
              const char* deviceName,
              const char* brokerIp,
-             uint16_t    brokerPort,
-             const char* brokerMdns,
+             uint16_t     brokerPort,
+             const char*  brokerMdns,
              LightingDevice* mainLight);
 
   // Call this in loop() while Wi-Fi is connected.
@@ -37,7 +54,8 @@ namespace mqtt_runtime {
 
   // Called when devices change state and we want instant aggregate update.
   void notifyStateChanged();
-}
+
+} // namespace mqtt_runtime
 
 // Legacy global alias (so any existing code calling this still compiles)
 inline void notifyMainStateChanged() {

@@ -9,7 +9,8 @@
 #define DEVICE_NAME "IEFP_AUDITORIUM"
 
 // ---------- MQTT Broker (TCP for ESP32) ----------
-#define BROKER_IP     "192.168.1.90"
+#define BROKER_IP     "10.30.14.37"
+//home test "192.168.1.90"
 #define BROKER_PORT  1883
 
 // Optional: mDNS hostname of the broker (without .local) — hint for UI
@@ -18,6 +19,6 @@
 #endif
 
 // ---------- GPIO ----------
-#define RELAY_PIN    25
-#define BUTTON_PIN   26
+#define BUTTON_PIN   25
+#define RELAY_PIN    26
 
